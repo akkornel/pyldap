@@ -1,0 +1,458 @@
+# -*- coding: utf-8 -*-
+"""
+Automatic tests for python-ldap's module ldap.syncrepl
+
+See http://www.python-ldap.org/ for details.
+
+$Id: $
+"""
+
+
+import os
+import unittest
+from slapdtest import SlapdTestCase
+import shelve
+
+
+# Switch off processing .ldaprc or ldap.conf before importing _ldap
+os.environ['LDAPNOINIT'] = '1'
+
+import ldap
+from ldap.ldapobject import SimpleLDAPObject
+
+
+# Test for pyasn1, which ldap.syncrepl requires.
+# If pyasn1 is missing, then don't load ldap.syncrepl, and skip all tests.
+try:
+    import pyasn1
+    pyasn1_present = True
+except:
+    pyasn1_present = False
+
+# If pyasn1 is present, then we can load ldap.syncrepl.
+# The syncrepl import is not in the try block, so exceptions will be noticed.
+if pyasn1_present is True:
+    from ldap.syncrepl import SyncreplConsumer
+else:
+    # Define an empty SyncreplConsumer class, so that our code compiles.
+    # (The tests will all skip, so methods will never be called.)
+    class SyncreplConsumer:
+        pass
+
+
+# Define initial data load, both as an LDIF and as a dictionary.
+LDIF_TEMPLATE = """dn: %(suffix)s
+objectClass: dcObject
+objectClass: organization
+dc: %(dc)s
+o: %(dc)s
+
+dn: %(rootdn)s
+objectClass: applicationProcess
+objectClass: simpleSecurityObject
+cn: %(rootcn)s
+userPassword: %(rootpw)s
+
+dn: cn=Foo1,%(suffix)s
+objectClass: organizationalRole
+cn: Foo1
+
+dn: cn=Foo2,%(suffix)s
+objectClass: organizationalRole
+cn: Foo2
+
+dn: cn=Foo3,%(suffix)s
+objectClass: organizationalRole
+cn: Foo3
+
+dn: ou=Container,%(suffix)s
+objectClass: organizationalUnit
+ou: Container
+
+dn: cn=Foo4,ou=Container,%(suffix)s
+objectClass: organizationalRole
+cn: Foo4
+
+"""
+
+# NOTE: For the dict, it needs to be kept up-to-date as we make changes!
+LDIF_AS_DICT={
+    'ou=Container,dc=slapd-test,dc=python-ldap,dc=org': {
+        'objectClass': ['organizationalUnit'],
+        'ou': ['Container']
+    },
+    'cn=Foo2,dc=slapd-test,dc=python-ldap,dc=org': {
+        'objectClass': ['organizationalRole'],
+        'cn': ['Foo2']
+    },
+    'cn=Foo4,ou=Container,dc=slapd-test,dc=python-ldap,dc=org': {
+        'objectClass': ['organizationalRole'],
+        'cn': ['Foo4']
+    },
+    'cn=Manager,dc=slapd-test,dc=python-ldap,dc=org': {
+        'objectClass': ['applicationProcess', 'simpleSecurityObject'],
+        'userPassword': ['password'],
+        'cn': ['Manager']
+    },
+    'cn=Foo3,dc=slapd-test,dc=python-ldap,dc=org': {
+        'objectClass': ['organizationalRole'],
+        'cn': ['Foo3']
+    },
+    'cn=Foo1,dc=slapd-test,dc=python-ldap,dc=org': {
+        'objectClass': ['organizationalRole'],
+        'cn': ['Foo1']
+    },
+    'dc=slapd-test,dc=python-ldap,dc=org': {
+        'objectClass': ['dcObject', 'organization'],
+        'dc': ['slapd-test'],
+        'o': ['slapd-test']
+    }
+}
+
+
+class Syncrepl_Tester(SimpleLDAPObject, SyncreplConsumer):
+    """
+    This is a very simple class to start up the syncrepl search
+    and handle callbacks that come in.
+
+    Needs to be separate, because once an LDAP client starts a syncrepl
+    search, it can't be used for anything else.
+    """
+    def __init__(self, uri, dn, password, storage=None):
+        """
+        Set up our object by creating a search client, connecting, and binding.
+        """
+
+        if storage is not None:
+            self.data = shelve.open(storage)
+            self.uuid_dn = shelve.open(storage + 'uuid_dn')
+            self.dn_attrs = shelve.open(storage + 'dn_attrs')
+            self.using_shelve = True
+        else:
+            self.data = {}
+            self.uuid_dn = {}
+            self.dn_attrs = {}
+            self.using_shelve = False
+
+        self.data['cookie'] = None
+        self.present = []
+        self.refresh_done = False
+
+        SimpleLDAPObject.__init__(self, uri)
+        self.simple_bind_s(dn, password)
+
+
+    def unbind_s(self):
+        """
+        In addition to unbinding from LDAP, we need to close the shelf.
+        """
+        if self.using_shelve is True:
+            self.data.close()
+            self.uuid_dn.close()
+            self.dn_attrs.close()
+        SimpleLDAPObject.unbind_s(self)
+
+
+    def search(self, search_base, search_mode):
+        """
+        Start a syncrepl search operation, given a base DN and search mode.
+        """
+        self.search_id = self.syncrepl_search(
+            search_base,
+            ldap.SCOPE_SUBTREE,
+            mode=search_mode,
+            filterstr='(objectClass=*)'
+        )
+
+
+    def cancel(self):
+        """
+        A simple wrapper to call parent class with syncrepl search ID.
+        """
+        SimpleLDAPObject.cancel(self, self.search_id)
+
+
+    def poll(self, timeout=None, all=0):
+        """
+        Take the params, add the syncrepl search ID, and call the proper poll.
+        """
+        return self.syncrepl_poll(
+            self.search_id,
+            timeout=timeout,
+            all=all
+        )
+
+
+    def syncrepl_get_cookie(self):
+        """
+        Pull cookie from storage, if one exists.
+        """
+        return self.data['cookie']
+
+
+    def syncrepl_set_cookie(self, cookie):
+        """
+        Update stored cookie.
+        """
+        self.data['cookie'] = cookie
+
+
+    def syncrepl_refreshdone(self):
+        """
+        Just update a variable.
+        """
+        self.refresh_done = True
+
+
+    def syncrepl_delete(self, uuids):
+        """
+        Delete the given items from both maps.
+        """
+        for uuid in uuids:
+            del self.dn_attrs[self.uuid_dn[uuid]]
+            del self.uuid_dn[uuid]
+
+
+    def syncrepl_entry(self, dn, attrs, uuid):
+        """
+        Handles adds and changes (including DN changes).
+        """
+        if uuid in self.uuid_dn:
+            # Catch changing DNs.
+            if dn != self.uuid_dn[uuid]:
+                # Delete data associated with old DN.
+                del self.dn_attrs[self.uuid_dn[uuid]]
+
+        # Update both maps.
+        self.uuid_dn[uuid] = dn
+        self.dn_attrs[dn] = attrs
+
+
+    def syncrepl_present(self, uuids, refreshDeletes=False):
+        """
+        The 'present' message from the LDAP server is the most complicated
+        part of the refresh phase.  Suggest looking here for more info:
+        http://syncrepl-client.readthedocs.io/en/latest/client.html
+        """
+        if ((uuids is not None) and (refreshDeletes is False)):
+            self.present.extend(uuids)
+
+        elif ((uuids is None) and (refreshDeletes is False)):
+            deleted_uuids = list()
+            for uuid in self.uuid_dn.keys():
+                if uuid not in self.present:
+                    deleted_uuids.append(uuid)
+
+            if len(deleted_uuids) > 0:
+                self.syncrepl_delete(deleted_uuids)
+
+        elif ((uuids is not None) and (refreshDeletes is True)):
+            self.syncrepl_delete(uuids)
+
+        elif ((uuids is None) and (refreshDeletes is True)):
+            pass
+
+
+@unittest.skipIf(
+    pyasn1_present is False,
+    'pyasn1 is not installed'
+)
+class Test01_Syncrepl(SlapdTestCase):
+    """
+    Test LDAP syncrepl operations
+    """
+
+    ldap_object_class = SimpleLDAPObject
+
+    @classmethod
+    def setUpClass(cls):
+        SlapdTestCase.setUpClass()
+        # insert some Foo* objects via ldapadd
+        cls.server.ldapadd(
+            LDIF_TEMPLATE % {
+                'suffix':cls.server.suffix,
+                'rootdn':cls.server.root_dn,
+                'rootcn':cls.server.root_cn,
+                'rootpw':cls.server.root_pw,
+                'dc': cls.server.suffix.split(',')[0][3:],
+            }
+        )
+
+
+    def setUp(self):
+        try:
+            self._ldap_conn
+        except AttributeError:
+            # open local LDAP connection
+            self._ldap_conn = self._open_ldap_conn()
+
+
+    def tearDown(self):
+        self.tester.unbind_s()
+
+
+    def test_refreshOnly_search(self):
+        '''
+        Test to see if we can initialize a syncrepl search.
+        '''
+        self.tester = Syncrepl_Tester(
+            self.server.ldap_uri,
+            self.server.root_dn,
+            self.server.root_pw
+        )
+        self.tester.search(
+            self.server.suffix,
+            'refreshOnly'
+        )
+
+
+    def test_refreshAndPersist_search(self):
+        self.tester = Syncrepl_Tester(
+            self.server.ldap_uri,
+            self.server.root_dn,
+            self.server.root_pw
+        )
+        self.tester.search(
+            self.server.suffix,
+            'refreshAndPersist'
+        )
+
+
+    def test_refreshOnly_poll_full(self):
+        """
+        Test doing a full refresh cycle, and check what we got.
+        """
+        self.tester = Syncrepl_Tester(
+            self.server.ldap_uri,
+            self.server.root_dn,
+            self.server.root_pw
+        )
+        self.tester.search(
+            self.server.suffix,
+            'refreshOnly'
+        )
+        poll_result = self.tester.poll(
+            all=1,
+            timeout=None
+        )
+        self.assertFalse(poll_result)
+        self.assertEquals(self.tester.dn_attrs, LDIF_AS_DICT)
+
+ 
+    def test_refreshAndPersist_poll_only(self):
+        """
+        Test the refresh part of refresh-and-persist, and check what we got.
+        """
+        self.tester = Syncrepl_Tester(
+            self.server.ldap_uri,
+            self.server.root_dn,
+            self.server.root_pw
+        )
+        self.tester.search(
+            self.server.suffix,
+            'refreshAndPersist'
+        )
+
+        # Make sure to stop the test before going into persist mode.
+        while self.tester.refresh_done is not True:
+            poll_result = self.tester.poll(
+                all=0,
+                timeout=None
+            )
+            self.assertTrue(poll_result)
+
+        self.assertEquals(self.tester.dn_attrs, LDIF_AS_DICT)
+
+
+    def test_refreshAndPersist_timeout(self):
+        """
+        Make sure refreshAndPersist can handle a search with timeouts.
+        """
+        self.tester = Syncrepl_Tester(
+            self.server.ldap_uri,
+            self.server.root_dn,
+            self.server.root_pw
+        )
+        self.tester.search(
+            self.server.suffix,
+            'refreshAndPersist'
+        )
+
+        # Run a quick refresh, that shouldn't have any changes.
+        while self.tester.refresh_done is not True:
+            poll_result = self.tester.poll(
+                all=0,
+                timeout=None
+            )
+            self.assertTrue(poll_result)
+
+        # Again, server data should not have changed.
+        self.assertEquals(self.tester.dn_attrs, LDIF_AS_DICT)
+
+        # Run a search with timeout.
+        # Nothing is changing the server, so it shoud timeout.
+        self.assertRaises(
+            ldap.TIMEOUT,
+            self.tester.poll,
+            all=0,
+            timeout=1
+        )
+
+
+    def test_refreshAndPersist_cancelled(self):
+        """
+        Make sure refreshAndPersist can handle cancelling a syncrepl search.
+        """
+        self.tester = Syncrepl_Tester(
+            self.server.ldap_uri,
+            self.server.root_dn,
+            self.server.root_pw
+        )
+        self.tester.search(
+            self.server.suffix,
+            'refreshAndPersist'
+        )
+
+        # Run a quick refresh, that shouldn't have any changes.
+        while self.tester.refresh_done is not True:
+            poll_result = self.tester.poll(
+                all=0,
+                timeout=None
+            )
+            self.assertTrue(poll_result)
+
+        # Again, server data should not have changed.
+        self.assertEquals(self.tester.dn_attrs, LDIF_AS_DICT)
+
+        # Request cancellation.
+        self.tester.cancel()
+
+        # Run another poll, without timeout, but which should cancel out.
+        self.assertRaises(
+            ldap.CANCELLED,
+            self.tester.poll,
+            all=1,
+            timeout=None
+        )
+
+        # Server data should still be intact.
+        self.assertEquals(self.tester.dn_attrs, LDIF_AS_DICT)
+
+
+    # TODO:
+    # * Make a new client, with a data store, and close.  Then, load a new
+    # client with the same datastore, and see if the data store loads OK.
+    # * Make a new client, with a data store, and close.  Then, load a new
+    # client with the same datastore.  Delete an entry, and the cookie.
+    # Start the sync, and everything should sync up OK.
+    # * Load the refreshOnly client, using existing data.  Make a change
+    # on the server, and the client should pick it up in the refresh phase.
+    # * Load the refreshAndPersist client, using existing data.  Make a change
+    # on the server, and the client should pick it up in the refresh phase.
+    # * Load the refreshAndPersist client, using existing data.  Let the
+    # refresh phase complete.  Make a change on the server, and the client
+    # should pick it up during the persist phase.
+
+
+if __name__ == '__main__':
+    unittest.main()
