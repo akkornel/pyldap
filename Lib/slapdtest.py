@@ -25,6 +25,7 @@ import urllib
 SLAPD_CONF_TEMPLATE = r"""
 serverID %(serverid)s
 moduleload back_%(database)s
+moduleload syncprov
 include "%(schema_include)s"
 loglevel %(loglevel)s
 allow bind_v2
@@ -38,6 +39,11 @@ directory "%(directory)s"
 suffix "%(suffix)s"
 rootdn "%(rootdn)s"
 rootpw "%(rootpw)s"
+
+overlay syncprov
+syncprov-checkpoint 100 10
+syncprov-sessionlog 100
+index objectclass,entryCSN,entryUUID eq
 """
 
 LOCALHOST = '127.0.0.1'
